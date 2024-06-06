@@ -24,10 +24,13 @@ type Position struct {
 type Data struct {
 	Ttff               int64       `json:"ttff"`
 	SystemTime         time.Time   `json:"systemtime"`
+	ActualSystemTime   time.Time   `json:"actual_systemtime"`
 	Timestamp          time.Time   `json:"timestamp"`
 	Fix                string      `json:"fix"`
 	Latitude           float64     `json:"latitude"`
+	UnfilteredLatitude float64     `json:"unfiltered_latitude"`
 	Longitude          float64     `json:"longitude"`
+	UnfilteredLongitude float64    `json:"unfiltered_longitude"`
 	Altitude           float64     `json:"height"`
 	Heading            float64     `json:"heading"`
 	Speed              float64     `json:"speed"`
@@ -38,6 +41,7 @@ type Data struct {
 	RF                 *RF         `json:"rf,omitempty"`
 	SpeedAccuracy      float64     `json:"speed_accuracy"`
 	HeadingAccuracy    float64     `json:"heading_accuracy"`
+	TimeResolved	   int         `json:"time_resolved"`
 	HorizontalAccuracy float64     `json:"horizontal_accuracy"`
 	VerticalAccuracy   float64     `json:"vertical_accuracy"`
 
@@ -49,22 +53,17 @@ type Data struct {
 	//todo: add optional signature and hash struct genereated from UBX-SEC-ECSIGN messages by the decoder
 }
 
-func (d *Data) GetStartTime() time.Time {
-	return d.startTime
-}
-
-func (d *Data) SetStartTime(startTime time.Time) {
-	d.startTime = startTime
-}
-
 func (d *Data) Clone() Data {
 	clone := Data{
 		Ttff:       d.Ttff,
 		SystemTime: d.SystemTime,
+		ActualSystemTime: d.ActualSystemTime,
 		Timestamp:  d.Timestamp,
 		Fix:        d.Fix,
 		Latitude:   d.Latitude,
+		UnfilteredLatitude: d.UnfilteredLatitude,
 		Longitude:  d.Longitude,
+		UnfilteredLongitude: d.UnfilteredLongitude,
 		Altitude:   d.Altitude,
 		Heading:    d.Heading,
 		Speed:      d.Speed,
@@ -83,6 +82,7 @@ func (d *Data) Clone() Data {
 		},
 		Sep:                d.Sep,
 		Eph:                d.Eph,
+		TimeResolved: 	 	d.TimeResolved,
 		SpeedAccuracy:      d.SpeedAccuracy,
 		HeadingAccuracy:    d.HeadingAccuracy,
 		HorizontalAccuracy: d.HorizontalAccuracy,
@@ -170,6 +170,7 @@ func NewDataFeed(handleData func(data *Data)) *DataFeed {
 		HandleData: handleData,
 		Data: &Data{
 			SystemTime: noTime,
+			ActualSystemTime: noTime,
 			Timestamp:  noTime,
 			Dop: &Dop{
 				GDop: 99.99,
@@ -181,17 +182,10 @@ func NewDataFeed(handleData func(data *Data)) *DataFeed {
 				YDop: 99.99,
 			},
 			Satellites: &Satellites{},
+			TimeResolved: 0,
 			RF:         &RF{},
 		},
 	}
-}
-
-func (d *DataFeed) GetStartTime() time.Time {
-	return d.Data.startTime
-}
-
-func (d *DataFeed) SetStartTime(startTime time.Time) {
-	d.Data.startTime = startTime
 }
 
 // GNSSfix Type: 0: no fix 1: dead reckoning only 2: 2D-fix 3: 3D-fix 4: GNSS + dead reckoning combined 5: time only fix
@@ -212,59 +206,28 @@ type RF struct {
 }
 
 const (
-    offsetMeasurementsNeeded = 100
-    maxAllowedOffset         = 2 * time.Second
-    maxAllowedFluctuation    = 50 * time.Millisecond
+	ignoreThreshold = 30
 )
 
 var (
-    timeOffset           time.Duration
-    offsetConfirmedTimes int
-    offsetConfirmed      bool
+	recCounter			int64
 )
-
-func calculateAndConfirmOffset(gnssTime, systemTime time.Time) {
-    if offsetConfirmed {
-        return
-    }
-
-    currentOffset := systemTime.Sub(gnssTime)
-    if currentOffset < -maxAllowedOffset || currentOffset > maxAllowedOffset {
-        offsetConfirmedTimes = 0
-        timeOffset = 0
-        return
-    }
-
-    if offsetConfirmedTimes < offsetMeasurementsNeeded {
-        if offsetConfirmedTimes > 0 && (currentOffset < timeOffset-maxAllowedFluctuation || currentOffset > timeOffset+maxAllowedFluctuation) {
-            fmt.Printf("Offset fluctuates too much: %v, resetting confirmation process\n", currentOffset)
-            offsetConfirmedTimes = 0
-            timeOffset = 0
-            return
-        }
-
-        timeOffset = ((timeOffset * time.Duration(offsetConfirmedTimes)) + currentOffset) / time.Duration(offsetConfirmedTimes+1)
-        offsetConfirmedTimes++
-        fmt.Printf("Current average offset after %d measurements: %v\n", offsetConfirmedTimes, timeOffset)
-    } else {
-        fmt.Printf("Confirmed offset: %v\n", timeOffset)
-        offsetConfirmed = true
-    }
-}
 
 func (df *DataFeed) HandleUbxMessage(msg interface{}) error {
 	data := df.Data
-
+ 
 	switch m := msg.(type) {
 	case *ubx.NavPvt:
 		now := time.Date(int(m.Year_y), time.Month(int(m.Month_month)), int(m.Day_d), int(m.Hour_h), int(m.Min_min), int(m.Sec_s), int(m.Nano_ns), time.UTC)
 		data.Timestamp = now
 
-        if offsetConfirmed {
-            data.SystemTime = data.Timestamp.Add(timeOffset)
-        } else {
-			data.SystemTime = time.Now()
-			calculateAndConfirmOffset(data.Timestamp, data.SystemTime)
+		data.ActualSystemTime = time.Now()
+		data.SystemTime = time.Now()
+
+		if m.Valid == ubx.NavPvtFullyResolved {
+			data.TimeResolved = 0
+		} else {
+			data.TimeResolved = 1
 		}
 
 		data.Fix = fix[m.FixType]
@@ -274,6 +237,8 @@ func (df *DataFeed) HandleUbxMessage(msg interface{}) error {
 		}
 		data.Latitude = float64(m.Lat_dege7) * 1e-7
 		data.Longitude = float64(m.Lon_dege7) * 1e-7
+		data.UnfilteredLatitude = float64(m.Lat_dege7) * 1e-7
+		data.UnfilteredLongitude = float64(m.Lon_dege7) * 1e-7
 
 		if m.FixType == 3 {
 			data.Altitude = float64(m.Height_mm) / 1000 //tv.Althae
@@ -302,7 +267,10 @@ func (df *DataFeed) HandleUbxMessage(msg interface{}) error {
 
 		// we receive NavDop at the end so we handleData here
 		clone := data.Clone()
-		df.HandleData(&clone)
+		recCounter++
+		if recCounter > ignoreThreshold {
+			df.HandleData(&clone)
+		}
 	case *ubx.NavSat:
 		data.Satellites.Seen = int(m.NumSvs)
 		data.Satellites.Used = 0
@@ -331,7 +299,9 @@ func (df *DataFeed) HandleUbxMessage(msg interface{}) error {
 	case *message.SecEcsignWithBuffer:
 		data.SecEcsign = m.SecEcsign
 		data.SecEcsignBuffer = m.Base64MessageBuffer
-		df.HandleData(data)
+		if recCounter > ignoreThreshold {
+			df.HandleData(data)
+		}
 	case *nmea.GGA:
 		data.GGA = m.Raw
 	}
